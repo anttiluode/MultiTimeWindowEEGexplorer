@@ -76,6 +76,13 @@ Click "Load Models from Folder" and select the folder containing your .pth files
 Click "Test New Random Sample" to load a random EEG trial
 Switch between tabs to see predictions from different time windows
 
+You are going to need models to point to. I have models that were trained for 250 
+epochs at: 
+
+https://huggingface.co/Aluode/MultiTimeWindowEEGModel 
+
+Frankly they are not great but they work. You can train more if you want to. 
+
 # What You'll See
 
 Each tab shows a different model's interpretation of the same EEG trial:
@@ -88,7 +95,7 @@ This is exploratory - you're looking at patterns, not ground truth decoding.
 
 # Notes
 
-Models are ~37MB each (185MB total for 5 models)
+Models are 23 to 37MB each 
 Training uses the same architecture (CNN+Transformer) with different input window sizes
 The viewer shows top 20 predictions ranked by probability
 Category predictions are from 38 object classes (animals, vehicles, food, outdoor objects)

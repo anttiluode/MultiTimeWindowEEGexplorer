@@ -25,6 +25,8 @@ EEG heatmaps for each time window
 
 This lets you see how predictions change across temporal windows - e.g., does the 50-150ms model predict different categories than the 250-350ms model for the same image?
 
+![MultiWindowViewer](./multiwindowviewer.png)
+
 # Requirements
 
 pip install torch torchvision datasets scipy matplotlib pillow scikit-learn

@@ -93,15 +93,17 @@ Training uses the same architecture (CNN+Transformer) with different input windo
 The viewer shows top 20 predictions ranked by probability
 Category predictions are from 38 object classes (animals, vehicles, food, outdoor objects)
 
-# Citation
+# Links: 
 
-Uses the Alljoined EEG-Image Dataset:
-@article{gifford2022alljoined,
-  title={The Alljoined EEG-Image Dataset},
-  author={Gifford, A. and others},
-  journal={arXiv preprint arXiv:2210.09450},
-  year={2022}
-}
+Alljoined 05 125 Dataset:
+
+https://huggingface.co/datasets/Alljoined/05_125
+
+COCO Annotations**: Required for multi-label ground truth (instances_train2017.json).
+
+Download: COCO Dataset Official Site
+
+(select "2017 Train/Val annotations [241MB]").
 
 # License
 

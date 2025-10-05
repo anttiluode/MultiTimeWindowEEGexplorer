@@ -1,7 +1,6 @@
 """
-Enhanced EEG Weak Signal Detector - FAST VERSION
-Applies zero-copy optimizations to the proven architecture
-NEW: Supports training of multiple time-window models sequentially.
+Multi-Window EEG Trainer - Sequential Training Across Time Windows
+Trains separate models for different ERP time ranges to analyze temporal dynamics
 """
 
 import os
@@ -29,23 +28,19 @@ try:
     torch.backends.cudnn.benchmark = True
 except ImportError as e:
     print(f"Missing dependency: {e}")
-    print("Install: pip install datasets scikit-learn")
     exit()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 EEG_SAMPLE_RATE = 512
-
-# SPEED SETTINGS
 FAST_BATCH_SIZE = 256
 FAST_NUM_WORKERS = 0
 
-# --- NEW: FIXED TIME WINDOWS FOR TEMPORAL ANALYSIS ---
-# Format: (start_ms, end_ms, label)
-FIXED_TIME_WINDOWS = [
-    (50, 150, "EarlyVisual"),    # P100/N100 range
-    (150, 250, "MidFeature"),     # N170/P200 range
-    (250, 350, "LateSemantic"),   # N400/LPC range (Your successful window)
-    (50, 250, "EarlyCombined"),   # For comparison
+# Time windows for temporal analysis
+TIME_WINDOWS = [
+    (50, 150, "EarlyVisual"),     # P100/N100
+    (150, 250, "MidFeature"),     # N170/P200
+    (250, 350, "LateSemantic"),   # N400/P300
+    (50, 250, "EarlyCombined"),   # Early+Mid
     (50, 350, "FullWindow")       # Baseline
 ]
 
@@ -68,7 +63,6 @@ def cohens_d(x, y):
     nx, ny = len(x), len(y)
     dof = nx + ny - 2
     return (np.mean(x) - np.mean(y)) / np.sqrt(((nx-1)*np.std(x, ddof=1)**2 + (ny-1)*np.std(y, ddof=1)**2) / dof)
-
 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, d_model, n_heads=8, dropout=0.1):
@@ -99,7 +93,6 @@ class MultiHeadSelfAttention(nn.Module):
         output = self.dropout(output)
         return self.layer_norm(residual + output)
 
-
 class FeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
@@ -116,7 +109,6 @@ class FeedForward(nn.Module):
         x = self.dropout(x)
         return self.layer_norm(residual + x)
 
-
 class HybridCNNTransformer(nn.Module):
     def __init__(self, n_channels=64, n_timepoints=154, num_classes=len(TARGET_CATEGORIES),
                  d_model=256, n_heads=8, n_layers=4, dropout=0.3):
@@ -129,11 +121,10 @@ class HybridCNNTransformer(nn.Module):
         self.pool2 = nn.MaxPool1d(2)
         self.conv3 = nn.Conv1d(256, d_model, kernel_size=7, padding=3)
         self.bn3 = nn.BatchNorm1d(d_model)
-        temp_size = n_timepoints
-        for _ in range(2):
-            temp_size = temp_size // 2
-        self.seq_len = int(temp_size)
-        self.pos_encoding = nn.Parameter(torch.randn(1, self.seq_len, d_model))
+        
+        self.d_model = d_model
+        self.dropout_val = dropout
+        
         self.transformer_layers = nn.ModuleList([
             nn.ModuleDict({
                 'attention': MultiHeadSelfAttention(d_model, n_heads, dropout),
@@ -141,8 +132,16 @@ class HybridCNNTransformer(nn.Module):
             }) for _ in range(n_layers)
         ])
         self.dropout = nn.Dropout(dropout)
+        
+        # FIXED: Determine actual feature size with dummy forward pass
+        with torch.no_grad():
+            dummy_input = torch.randn(1, n_channels, n_timepoints)
+            dummy_out = self._forward_features(dummy_input)
+            feature_size = dummy_out.shape[1]
+        
+        # Build classifier with known feature size
         self.classifier = nn.Sequential(
-            nn.Linear(d_model * self.seq_len, 512),
+            nn.Linear(feature_size, 512),
             nn.BatchNorm1d(512),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -153,22 +152,36 @@ class HybridCNNTransformer(nn.Module):
             nn.Linear(256, num_classes)
         )
         
-    def forward(self, x):
+    def _forward_features(self, x):
+        """Feature extraction without classifier"""
         x = self.pool1(F.elu(self.bn1(self.conv1(x))))
         x = self.pool2(F.elu(self.bn2(self.conv2(x))))
         x = F.elu(self.bn3(self.conv3(x)))
         x = x.transpose(1, 2)
+        
+        batch_size, seq_len, d_model = x.shape
+        
+        if not hasattr(self, 'pos_encoding') or self.pos_encoding.shape[1] != seq_len:
+            self.pos_encoding = nn.Parameter(
+                torch.randn(1, seq_len, d_model, device=x.device) * 0.02
+            )
+        
         x = x + self.pos_encoding
+        
         for layer in self.transformer_layers:
             x = layer['attention'](x)
             x = layer['feedforward'](x)
+        
         x = x.reshape(x.size(0), -1)
         x = self.dropout(x)
+        return x
+        
+    def forward(self, x):
+        x = self._forward_features(x)
         return self.classifier(x)
 
-
 class FastEEGDataset(Dataset):
-    """OPTIMIZED: Pre-cache as tensors, not numpy"""
+    """Simple dataset - no synthetic data generation"""
     def __init__(self, coco_path, annotations_path, split='train', max_samples=None,
                  start_ms=50, end_ms=350, trials_to_average=1):
         self.coco_path = Path(coco_path)
@@ -176,7 +189,12 @@ class FastEEGDataset(Dataset):
         self.end_ms = end_ms
         self.trials_to_average = trials_to_average
         
-        print(f"Loading Alljoined ({split}) with window {start_ms}-{end_ms}ms...")
+        # FIXED: Compute exact n_timepoints for consistency
+        self.start_idx = int((start_ms / 1000.0) * EEG_SAMPLE_RATE)
+        self.end_idx = int((end_ms / 1000.0) * EEG_SAMPLE_RATE)
+        self.n_timepoints = self.end_idx - self.start_idx
+        
+        print(f"Loading Alljoined ({split}) with window {start_ms}-{end_ms}ms (exact length: {self.n_timepoints})...")
         self.dataset = load_dataset("Alljoined/05_125", split=split, streaming=False)
         
         if max_samples:
@@ -189,11 +207,10 @@ class FastEEGDataset(Dataset):
         self.image_categories = defaultdict(set)
         for ann in coco_data['annotations']:
             img_id = ann['image_id']
-            cat_id = ann['category_id']
-            if cat_id in CATEGORY_NAMES:
-                self.image_categories[img_id].add(cat_id)
+            if ann['category_id'] in CATEGORY_NAMES:
+                self.image_categories[img_id].add(ann['category_id'])
         
-        # OPTIMIZED: Pre-cache as TENSORS
+        # Pre-cache as tensors
         print("Pre-caching EEG data as tensors...")
         self.cached_eeg = {}
         self.category_samples = defaultdict(list)
@@ -208,7 +225,6 @@ class FastEEGDataset(Dataset):
                         label[cat_idx] = 1.0
                 
                 if label.sum() > 0:
-                    # Cache as tensor immediately
                     eeg_tensor = self._get_eeg_tensor(sample)
                     self.cached_eeg[idx] = eeg_tensor
                     
@@ -227,17 +243,22 @@ class FastEEGDataset(Dataset):
         return len(self.samples)
     
     def _get_eeg_tensor(self, sample):
-        """Extract and convert to tensor in one pass"""
         eeg_data = np.array(sample['EEG'], dtype=np.float32)
-        start_idx = int((self.start_ms / 1000) * EEG_SAMPLE_RATE)
-        end_idx = int((self.end_ms / 1000) * EEG_SAMPLE_RATE)
         
-        if eeg_data.shape[1] >= end_idx:
-            eeg_window = eeg_data[:, start_idx:end_idx]
+        if eeg_data.shape[1] >= self.end_idx:
+            eeg_window = eeg_data[:, self.start_idx:self.end_idx]
         else:
-            eeg_window = eeg_data[:, start_idx:]
+            eeg_window = eeg_data[:, self.start_idx:]
         
-        # Z-score
+        # Ensure exact length matches model expectation
+        if eeg_window.shape[1] != self.n_timepoints:
+            # Pad or truncate if dataset edge case (rare, but safe)
+            if eeg_window.shape[1] < self.n_timepoints:
+                pad_width = self.n_timepoints - eeg_window.shape[1]
+                eeg_window = np.pad(eeg_window, ((0,0), (0, pad_width)), mode='constant', constant_values=0)
+            else:
+                eeg_window = eeg_window[:, :self.n_timepoints]
+        
         eeg_window = (eeg_window - eeg_window.mean(axis=1, keepdims=True)) / \
                      (eeg_window.std(axis=1, keepdims=True) + 1e-8)
         
@@ -252,35 +273,29 @@ class FastEEGDataset(Dataset):
             available_samples = self.category_samples[cat_idx]
             
             n_to_sample = min(self.trials_to_average, len(available_samples))
-            replace_needed = n_to_sample > len(available_samples)
-            selected = np.random.choice(len(available_samples), size=n_to_sample, replace=replace_needed)
+            selected = np.random.choice(len(available_samples), size=n_to_sample, replace=True)
             
-            # Stack and average tensors (faster than numpy)
             eeg_tensors = [self.cached_eeg[available_samples[s][0]] for s in selected]
             eeg = torch.stack(eeg_tensors).mean(dim=0)
         else:
             eeg = self.cached_eeg[sample_idx].clone()
         
-        # In-place augmentation
         if np.random.rand() > 0.5:
             eeg.add_(torch.randn_like(eeg) * 0.05)
         
         return eeg, label
 
-
-class EnhancedTrainerGUI(tk.Tk):
+class MultiWindowTrainerGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Enhanced EEG Signal Trainer - FAST")
+        self.title("Multi-Window EEG Trainer")
         self.geometry("1200x950")
         
         self.coco_path = ""
         self.annotations_path = ""
-        self.model = None
         self.train_thread = None
         self.stop_flag = threading.Event()
         self.log_queue = queue.Queue()
-        self.scaler = GradScaler('cuda')
         
         self.setup_gui()
         self.process_logs()
@@ -292,19 +307,14 @@ class EnhancedTrainerGUI(tk.Tk):
         train_tab = ttk.Frame(notebook)
         notebook.add(train_tab, text="Training")
         self.setup_train_tab(train_tab)
-        
-        analysis_tab = ttk.Frame(notebook)
-        notebook.add(analysis_tab, text="Statistical Analysis")
-        self.setup_analysis_tab(analysis_tab)
     
     def setup_train_tab(self, parent):
-        title = tk.Label(parent, text="Hybrid CNN-Transformer (FAST)", 
+        title = tk.Label(parent, text="Multi-Window Temporal Analysis", 
                         font=("Arial", 14, "bold"))
         title.pack(pady=5)
         
         info = tk.Label(parent, 
-                       text=f"Speed optimizations: Tensor cache + AMP + Batch={FAST_BATCH_SIZE}\n"
-                            "Proven architecture: 4 layers (AUROC 0.96)",
+                       text="Trains 5 separate models for different ERP time ranges",
                        fg="green", font=("Arial", 9))
         info.pack(pady=5)
         
@@ -323,7 +333,7 @@ class EnhancedTrainerGUI(tk.Tk):
         ttk.Button(path_frame, text="Browse", command=self.browse_ann).grid(row=1, column=2)
         
         # Settings
-        settings_frame = ttk.LabelFrame(parent, text="Configuration")
+        settings_frame = ttk.LabelFrame(parent, text="Training Settings")
         settings_frame.pack(pady=5, padx=10, fill=tk.X)
         
         tk.Label(settings_frame, text="Max Samples:").grid(row=0, column=0, padx=5)
@@ -331,37 +341,31 @@ class EnhancedTrainerGUI(tk.Tk):
         tk.Spinbox(settings_frame, from_=1000, to=10000, increment=1000,
                   textvariable=self.max_var, width=10).grid(row=0, column=1)
         
-        tk.Label(settings_frame, text="Epochs:").grid(row=0, column=2, padx=5)
-        self.epochs_var = tk.IntVar(value=1000) # Increased default for multi-window
-        tk.Spinbox(settings_frame, from_=200, to=2000, increment=100,
+        tk.Label(settings_frame, text="Epochs per model:").grid(row=0, column=2, padx=5)
+        self.epochs_var = tk.IntVar(value=1000)
+        tk.Spinbox(settings_frame, from_=100, to=2000, increment=100,
                   textvariable=self.epochs_var, width=10).grid(row=0, column=3)
         
-        tk.Label(settings_frame, text="Transformer Layers:").grid(row=1, column=0, padx=5)
-        self.n_layers_var = tk.IntVar(value=4)
-        tk.Spinbox(settings_frame, from_=2, to=8, increment=1,
-                  textvariable=self.n_layers_var, width=10).grid(row=1, column=1)
-        
-        tk.Label(settings_frame, text="Attention Heads:").grid(row=1, column=2, padx=5)
-        self.n_heads_var = tk.IntVar(value=8)
-        tk.Spinbox(settings_frame, from_=4, to=16, increment=4,
-                  textvariable=self.n_heads_var, width=10).grid(row=1, column=3)
-        
-        tk.Label(settings_frame, text="Trials to Average:").grid(row=2, column=0, padx=5)
+        tk.Label(settings_frame, text="Trials to Average:").grid(row=1, column=0, padx=5)
         self.avg_trials_var = tk.IntVar(value=2)
         tk.Spinbox(settings_frame, from_=1, to=5, increment=1,
-                  textvariable=self.avg_trials_var, width=10).grid(row=2, column=1)
+                  textvariable=self.avg_trials_var, width=10).grid(row=1, column=1)
         
-        # --- REMOVED Single Window controls (row 2, columns 2 & 3) ---
-        tk.Label(settings_frame, text="Window: (Multi-Mode)").grid(row=2, column=2, columnspan=2, padx=5)
+        # Time windows display
+        windows_frame = ttk.LabelFrame(parent, text="Time Windows")
+        windows_frame.pack(pady=5, padx=10, fill=tk.X)
+        
+        for start, end, label in TIME_WINDOWS:
+            tk.Label(windows_frame, text=f"{label}: {start}-{end}ms", 
+                    font=("Courier", 9)).pack(anchor=tk.W, padx=10)
         
         # Buttons
         btn_frame = tk.Frame(parent)
         btn_frame.pack(pady=5)
         
-        # --- NEW: Multi-Train Button ---
-        self.train_btn = tk.Button(btn_frame, text="Train 5 Multi-Window Models", 
-                                   command=self.start_multi_train,
-                                   bg="#9C27B0", fg="white", font=("Arial", 10, "bold"))
+        self.train_btn = tk.Button(btn_frame, text="Train All 5 Models", 
+                                   command=self.start_train,
+                                   bg="#4CAF50", fg="white", font=("Arial", 10, "bold"))
         self.train_btn.pack(side=tk.LEFT, padx=5)
         
         self.stop_btn = tk.Button(btn_frame, text="Stop", 
@@ -369,11 +373,6 @@ class EnhancedTrainerGUI(tk.Tk):
                                   bg="#f44336", fg="white",
                                   state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.analyze_btn = tk.Button(btn_frame, text="Statistical Analysis (WIP)",
-                                     command=self.analyze_signals,
-                                     bg="#2196F3", fg="white", state=tk.DISABLED)
-        self.analyze_btn.pack(side=tk.LEFT, padx=5)
         
         # Progress
         self.progress = ttk.Progressbar(parent, mode='determinate')
@@ -383,17 +382,9 @@ class EnhancedTrainerGUI(tk.Tk):
         log_frame = ttk.LabelFrame(parent, text="Training Log")
         log_frame.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
         
-        self.log_text = tk.Text(log_frame, height=12, bg='black', fg='lightgreen',
+        self.log_text = tk.Text(log_frame, height=15, bg='black', fg='lightgreen',
                                font=('Courier', 8))
         self.log_text.pack(fill=tk.BOTH, expand=True)
-    
-    # ... (setup_analysis_tab, browse_coco, browse_ann, log, process_logs remain the same)
-    def setup_analysis_tab(self, parent):
-        self.fig, self.axes = plt.subplots(2, 2, figsize=(12, 8))
-        self.fig.tight_layout(pad=3.0)
-        
-        self.canvas = FigureCanvasTkAgg(self.fig, parent)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
     
     def browse_coco(self):
         path = filedialog.askdirectory()
@@ -419,9 +410,8 @@ class EnhancedTrainerGUI(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self.process_logs)
-
-    # --- NEW: Multi-Train Entry Point ---
-    def start_multi_train(self):
+    
+    def start_train(self):
         if not self.coco_path or not self.annotations_path:
             messagebox.showerror("Error", "Select paths first")
             return
@@ -430,72 +420,61 @@ class EnhancedTrainerGUI(tk.Tk):
         self.train_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         
-        self.train_thread = threading.Thread(target=self._multi_train_loop, daemon=True)
+        self.train_thread = threading.Thread(target=self._train_all_windows, daemon=True)
         self.train_thread.start()
-        
+    
     def stop_train(self):
         self.stop_flag.set()
-
-    # --- NEW: Master Loop to Train All Windows ---
-    def _multi_train_loop(self):
+    
+    def _train_all_windows(self):
         try:
-            n_models = len(FIXED_TIME_WINDOWS)
-            total_epochs = self.epochs_var.get()
+            self.log("="*70)
+            self.log("MULTI-WINDOW TEMPORAL ANALYSIS")
+            self.log("="*70)
             
-            for i, (start_ms, end_ms, label) in enumerate(FIXED_TIME_WINDOWS):
+            n_windows = len(TIME_WINDOWS)
+            
+            for i, (start_ms, end_ms, label) in enumerate(TIME_WINDOWS):
                 if self.stop_flag.is_set():
-                    self.log("\nMulti-training interrupted by user.")
                     break
                 
-                # Calculate progress range for the current model
-                start_prog = (i / n_models) * 100
-                end_prog = ((i + 1) / n_models) * 100
-
                 self.log(f"\n{'='*70}")
-                self.log(f"STARTING MODEL {i+1}/{n_models}: {label} ({start_ms}-{end_ms}ms)")
+                self.log(f"MODEL {i+1}/{n_windows}: {label} ({start_ms}-{end_ms}ms)")
                 self.log(f"{'='*70}")
-
-                # Call the core training routine for this single window
-                self._single_train_loop(
-                    start_ms, end_ms, label, total_epochs, start_prog, end_prog
-                )
+                
+                self._train_single_window(start_ms, end_ms, label, i, n_windows)
             
             self.log("\n" + "="*70)
-            self.log("ALL MULTI-WINDOW MODELS TRAINED.")
+            self.log("ALL MODELS COMPLETE")
             self.log("="*70)
             
         except Exception as e:
-            self.log(f"MASTER ERROR: {e}")
+            self.log(f"ERROR: {e}")
             import traceback
             self.log(traceback.format_exc())
-            
         finally:
             self.train_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
-            # Re-enable analyze button if models were trained (WIP status set in old analyze_signals)
-
-    # --- REVISED: Single Training Loop to be called by Master Loop ---
-    def _single_train_loop(self, start_ms, end_ms, label, total_epochs, start_prog, end_prog):
+    
+    def _train_single_window(self, start_ms, end_ms, label, window_idx, total_windows):
+        # FIXED: Compute exact n_timepoints from idx difference
+        start_idx = int((start_ms / 1000.0) * EEG_SAMPLE_RATE)
+        end_idx = int((end_ms / 1000.0) * EEG_SAMPLE_RATE)
+        n_timepoints = end_idx - start_idx
         
-        n_layers = self.n_layers_var.get()
-        n_heads = self.n_heads_var.get()
-        trials_avg = self.avg_trials_var.get()
-        
-        n_timepoints = int(((end_ms - start_ms) / 1000) * EEG_SAMPLE_RATE)
-        
-        # 1. Setup Model (New instance for each window)
+        # Create model
         model = HybridCNNTransformer(
             n_timepoints=n_timepoints,
             num_classes=len(TARGET_CATEGORIES),
-            n_layers=n_layers,
-            n_heads=n_heads,
+            n_layers=4,
+            n_heads=8,
             dropout=0.3
         ).to(DEVICE)
         
-        params = sum(p.numel() for p in model.parameters())
-        self.log(f"  Parameters: {params:,} | Timepoints: {n_timepoints}")
+        self.log(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        self.log(f"Exact timepoints: {n_timepoints}")
         
-        # 2. Setup Data (New Dataset instance for each window)
+        # Create dataset
         dataset = FastEEGDataset(
             self.coco_path,
             self.annotations_path,
@@ -503,8 +482,9 @@ class EnhancedTrainerGUI(tk.Tk):
             int(self.max_var.get() * 1.25),
             start_ms=start_ms,
             end_ms=end_ms,
-            trials_to_average=trials_avg
+            trials_to_average=self.avg_trials_var.get()
         )
+        
         total = len(dataset)
         train_size = int(0.8 * total)
         val_size = total - train_size
@@ -513,7 +493,8 @@ class EnhancedTrainerGUI(tk.Tk):
             dataset, [train_size, val_size],
             generator=torch.Generator().manual_seed(42)
         )
-        self.log(f"  Train: {train_size}, Val: {val_size}")
+        
+        self.log(f"Train: {train_size}, Val: {val_size}")
         
         train_loader = DataLoader(train_set, batch_size=FAST_BATCH_SIZE, shuffle=True, 
                                  num_workers=FAST_NUM_WORKERS, pin_memory=True)
@@ -522,41 +503,39 @@ class EnhancedTrainerGUI(tk.Tk):
         
         optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
         criterion = nn.BCEWithLogitsLoss()
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=50, T_mult=2
-        )
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2)
+        scaler = GradScaler('cuda')
         
         best_val_auroc = 0.0
-        best_val_loss = float('inf')
-
-        # 3. Training Loop
-        for epoch in range(total_epochs):
+        
+        for epoch in range(self.epochs_var.get()):
             if self.stop_flag.is_set():
                 break
             
-            # Training
+            # Train
             model.train()
             train_loss = 0
             for eeg, labels in train_loader:
-                if self.stop_flag.is_set(): break
+                if self.stop_flag.is_set():
+                    break
                 eeg = eeg.to(DEVICE, non_blocking=True)
                 labels = labels.to(DEVICE, non_blocking=True)
                 optimizer.zero_grad()
                 with autocast('cuda'):
                     logits = model(eeg)
                     loss = criterion(logits, labels)
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(optimizer)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                scaler.step(optimizer)
+                scaler.update()
                 train_loss += loss.item()
-
-            # Validation
+            
+            # Validate
             model.eval()
             val_loss = 0
-            all_val_probs = []
-            all_val_labels = []
+            all_probs = []
+            all_labels = []
             with torch.no_grad():
                 for eeg, labels in val_loader:
                     eeg = eeg.to(DEVICE, non_blocking=True)
@@ -566,62 +545,43 @@ class EnhancedTrainerGUI(tk.Tk):
                         loss = criterion(logits, labels)
                     val_loss += loss.item()
                     probs = torch.sigmoid(logits.float())
-                    all_val_probs.append(probs.cpu().numpy())
-                    all_val_labels.append(labels.cpu().numpy())
+                    all_probs.append(probs.cpu().numpy())
+                    all_labels.append(labels.cpu().numpy())
             
             train_loss /= len(train_loader)
             val_loss /= len(val_loader)
             
-            val_probs = np.concatenate(all_val_probs)
-            val_labels = np.concatenate(all_val_labels)
             try:
-                val_auroc = roc_auc_score(val_labels, val_probs, average='macro')
-                auroc_str = f"AUROC={val_auroc:.4f}"
-            except ValueError:
+                val_auroc = roc_auc_score(np.concatenate(all_labels), np.concatenate(all_probs), average='macro')
+            except:
                 val_auroc = 0.0
-                auroc_str = "AUROC=N/A"
             
             scheduler.step()
             
-            # Update overall progress
-            current_model_progress = (epoch + 1) / total_epochs
-            self.progress['value'] = start_prog + current_model_progress * (end_prog - start_prog)
+            # Progress
+            model_progress = (epoch + 1) / self.epochs_var.get()
+            total_progress = (window_idx + model_progress) / total_windows * 100
+            self.progress['value'] = total_progress
             
-            self.log(f"  Epoch {epoch+1}/{total_epochs}: "
-                    f"TrLoss={train_loss:.4f} ValLoss={val_loss:.4f} {auroc_str} ")
+            if epoch % 10 == 0:
+                self.log(f"Epoch {epoch+1}/{self.epochs_var.get()}: "
+                        f"TrLoss={train_loss:.4f} ValLoss={val_loss:.4f} AUROC={val_auroc:.4f}")
             
-            is_better = (val_auroc > best_val_auroc) if val_auroc > 0 else (val_loss < best_val_loss)
-
-            if is_better:
-                best_val_loss = val_loss
+            if val_auroc > best_val_auroc:
                 best_val_auroc = val_auroc
-                
-                # --- NEW: Unique Filename for each window ---
-                model_filename = f"signal_detector_{start_ms}_{end_ms}ms_{label}.pth"
-                
+                filename = f"model_{start_ms}_{end_ms}ms_{label}.pth"
                 torch.save({
                     'model_state_dict': model.state_dict(),
-                    'val_loss': val_loss,
                     'val_auroc': val_auroc,
                     'start_ms': start_ms,
                     'end_ms': end_ms,
-                    'n_layers': n_layers,
-                    'n_heads': n_heads,
-                    'time_label': label,
-                }, model_filename)
-                self.log(f"  -> SAVED BEST: {model_filename} (AUROC={val_auroc:.4f})")
+                    'label': label
+                }, filename)
+                if epoch % 10 == 0:
+                    self.log(f"  -> Saved: {filename}")
         
-        self.log(f"  COMPLETE: Best AUROC for {label} was {best_val_auroc:.4f}")
-
-
-    # --- analyze_signals kept for reference, but disabled in GUI for multi-train mode ---
-    def analyze_signals(self):
-        # This function would need to be re-written to load ALL trained models
-        # for a comprehensive analysis, which is complex and outside this request's scope.
-        # It is kept here as a disabled placeholder.
-        messagebox.showinfo("WIP", "Statistical Analysis must be adapted for multi-model output. Please analyze the individual .pth files.")
-        pass
+        self.log(f"Best AUROC: {best_val_auroc:.4f}")
 
 if __name__ == "__main__":
-    app = EnhancedTrainerGUI()
+    app = MultiWindowTrainerGUI()
     app.mainloop()
